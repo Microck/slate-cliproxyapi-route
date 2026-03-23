@@ -265,14 +265,647 @@ function normalizeMessageContent(content) {
     .join("\n");
 }
 
+function parseBalancedJsonObject(input, startIndex) {
+  if (input[startIndex] !== "{") {
+    return null;
+  }
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let index = startIndex; index < input.length; index += 1) {
+    const char = input[index];
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (char === "\\") {
+        escape = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      depth += 1;
+      continue;
+    }
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return {
+          text: input.slice(startIndex, index + 1),
+          endIndex: index + 1,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function extractInlineToolCalls(input) {
+  const text = String(input || "");
+  const calls = [];
+  let cleaned = "";
+  let cursor = 0;
+
+  while (cursor < text.length) {
+    const matchIndex = text.indexOf("to=", cursor);
+    if (matchIndex === -1) {
+      cleaned += text.slice(cursor);
+      break;
+    }
+
+    cleaned += text.slice(cursor, matchIndex);
+    let index = matchIndex + 3;
+    while (index < text.length && /[A-Za-z0-9_.-]/.test(text[index])) {
+      index += 1;
+    }
+    const toolName = text.slice(matchIndex + 3, index);
+    const codePrefix = " code=";
+    if (!toolName || text.slice(index, index + codePrefix.length) !== codePrefix) {
+      cleaned += text.slice(matchIndex, index);
+      cursor = index;
+      continue;
+    }
+
+    const payloadStart = index + codePrefix.length;
+    const parsed = parseBalancedJsonObject(text, payloadStart);
+    if (!parsed) {
+      cleaned += text.slice(matchIndex);
+      break;
+    }
+
+    try {
+      calls.push({
+        raw: text.slice(matchIndex, parsed.endIndex),
+        toolName,
+        payload: JSON.parse(parsed.text),
+      });
+    } catch (error) {
+      cleaned += text.slice(matchIndex, parsed.endIndex);
+    }
+    cursor = parsed.endIndex;
+  }
+
+  return {
+    calls,
+    cleanedText: cleaned.trim(),
+  };
+}
+
+function sanitizeAssistantContent(content) {
+  const { cleanedText } = extractInlineToolCalls(content);
+  return cleanedText;
+}
+
 function translateMessages(messages) {
   return (messages || [])
     .filter((message) => ["system", "user", "assistant"].includes(message.role))
     .map((message) => ({
       role: message.role,
-      content: normalizeMessageContent(message.content),
+      content:
+        message.role === "assistant"
+          ? sanitizeAssistantContent(normalizeMessageContent(message.content))
+          : normalizeMessageContent(message.content),
     }))
     .filter((message) => message.content);
+}
+
+function extractWorkingDirectory(requestBody) {
+  const sources = [];
+  for (const message of requestBody.messages || []) {
+    sources.push(normalizeMessageContent(message.content));
+  }
+  if (typeof requestBody.context === "string") {
+    sources.push(requestBody.context);
+  }
+  const combined = sources.join("\n");
+  const match = combined.match(/<working_directory>([^<]+)<\/working_directory>/);
+  return match ? match[1].trim() : process.cwd();
+}
+
+function localToolSystemPrompt(cwd) {
+  return [
+    "You are running behind a local compatibility layer that provides real filesystem and shell tools.",
+    "Use the provided function tools whenever you need to inspect files, search code, run commands, or edit files.",
+    'Never print raw tool invocations like `to=container.exec code=...` in normal text.',
+    "If tools are needed, call the function tools directly instead of describing the call.",
+    `Current working directory: ${cwd}`,
+  ].join("\n");
+}
+
+function withLocalToolPrompt(messages, cwd) {
+  const prompt = { role: "system", content: localToolSystemPrompt(cwd) };
+  return [prompt, ...messages];
+}
+
+function localToolDefinitions() {
+  return [
+    {
+      type: "function",
+      function: {
+        name: "bash",
+        description: "Run a shell command in the current workspace with bash -lc.",
+        parameters: {
+          type: "object",
+          properties: {
+            command: { type: "string" },
+            timeoutMs: { type: "number" },
+          },
+          required: ["command"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "exec_process",
+        description: "Run a process with an explicit command and argument array.",
+        parameters: {
+          type: "object",
+          properties: {
+            cmd: {
+              oneOf: [
+                { type: "string" },
+                {
+                  type: "array",
+                  items: { type: "string" },
+                  minItems: 1,
+                },
+              ],
+            },
+            timeoutMs: { type: "number" },
+          },
+          required: ["cmd"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "Read a text file. Optionally limit by line range.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            startLine: { type: "number" },
+            endLine: { type: "number" },
+          },
+          required: ["path"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "list_files",
+        description: "List files and directories under a path.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            depth: { type: "number" },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "grep_files",
+        description: "Search for a regex pattern in files under a path.",
+        parameters: {
+          type: "object",
+          properties: {
+            pattern: { type: "string" },
+            path: { type: "string" },
+            caseSensitive: { type: "boolean" },
+          },
+          required: ["pattern"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "write_file",
+        description: "Write full text content to a file, creating parent directories if needed.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            content: { type: "string" },
+          },
+          required: ["path", "content"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "replace_in_file",
+        description: "Replace text in a file.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            search: { type: "string" },
+            replace: { type: "string" },
+            replaceAll: { type: "boolean" },
+          },
+          required: ["path", "search", "replace"],
+        },
+      },
+    },
+  ];
+}
+
+function finishUsage(usage) {
+  if (!usage) {
+    return undefined;
+  }
+  return {
+    promptTokens: usage.prompt_tokens || 0,
+    completionTokens: usage.completion_tokens || 0,
+  };
+}
+
+function mergeUsageTotals(base, usage) {
+  if (!usage) {
+    return base;
+  }
+  const current = base || {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+    prompt_tokens_details: {},
+    completion_tokens_details: {},
+  };
+  current.prompt_tokens += usage.prompt_tokens || 0;
+  current.completion_tokens += usage.completion_tokens || 0;
+  current.total_tokens += usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
+  return current;
+}
+
+function resolvePath(cwd, targetPath) {
+  const expanded = expandHome(String(targetPath || ""));
+  return path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+}
+
+function runProcess(command, args, options = {}) {
+  return new Promise((resolve) => {
+    const child = childProcess.spawn(command, args, {
+      cwd: options.cwd || process.cwd(),
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let timedOut = false;
+    const timeoutMs = Number(options.timeoutMs || 120000);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+    child.stderr.on("data", (chunk) => stderrChunks.push(chunk));
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({
+        ok: code === 0 && !timedOut,
+        exitCode: code,
+        signal: signal || null,
+        timedOut,
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+      });
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({
+        ok: false,
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: error && error.message ? error.message : String(error),
+      });
+    });
+  });
+}
+
+function readFileRange(filePath, startLine, endLine) {
+  const content = fs.readFileSync(filePath, "utf8");
+  if (!startLine && !endLine) {
+    return content;
+  }
+  const lines = content.split("\n");
+  const from = Math.max(1, Number(startLine || 1));
+  const to = Math.min(lines.length, Number(endLine || lines.length));
+  return lines.slice(from - 1, to).join("\n");
+}
+
+function listFilesTree(targetPath, depth) {
+  const results = [];
+  function visit(currentPath, currentDepth) {
+    if (currentDepth > depth) {
+      return;
+    }
+    const entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+      results.push({
+        path: fullPath,
+        type: entry.isDirectory() ? "directory" : "file",
+      });
+      if (entry.isDirectory()) {
+        visit(fullPath, currentDepth + 1);
+      }
+    }
+  }
+  visit(targetPath, 1);
+  return results;
+}
+
+async function executeLocalTool(name, args, cwd) {
+  try {
+    switch (name) {
+      case "bash": {
+        return await runProcess("bash", ["-lc", String(args.command || "")], {
+          cwd,
+          timeoutMs: args.timeoutMs,
+        });
+      }
+      case "exec_process": {
+        const commandValue = args.cmd;
+        if (Array.isArray(commandValue) && commandValue.length > 0) {
+          const [command, ...rest] = commandValue.map(String);
+          return await runProcess(command, rest, { cwd, timeoutMs: args.timeoutMs });
+        }
+        if (typeof commandValue === "string" && commandValue) {
+          return await runProcess("bash", ["-lc", commandValue], { cwd, timeoutMs: args.timeoutMs });
+        }
+        return { ok: false, stderr: "Invalid exec_process cmd", stdout: "", exitCode: null, signal: null, timedOut: false };
+      }
+      case "read_file": {
+        const filePath = resolvePath(cwd, args.path);
+        return {
+          ok: true,
+          path: filePath,
+          content: readFileRange(filePath, args.startLine, args.endLine),
+        };
+      }
+      case "list_files": {
+        const targetPath = resolvePath(cwd, args.path || ".");
+        return {
+          ok: true,
+          path: targetPath,
+          entries: listFilesTree(targetPath, Math.max(1, Number(args.depth || 2))),
+        };
+      }
+      case "grep_files": {
+        const targetPath = resolvePath(cwd, args.path || ".");
+        const rgArgs = ["-n"];
+        if (!args.caseSensitive) {
+          rgArgs.push("-i");
+        }
+        rgArgs.push(String(args.pattern), targetPath);
+        return await runProcess("rg", rgArgs, { cwd, timeoutMs: 120000 });
+      }
+      case "write_file": {
+        const filePath = resolvePath(cwd, args.path);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, String(args.content || ""), "utf8");
+        return { ok: true, path: filePath, bytes: Buffer.byteLength(String(args.content || ""), "utf8") };
+      }
+      case "replace_in_file": {
+        const filePath = resolvePath(cwd, args.path);
+        const source = fs.readFileSync(filePath, "utf8");
+        const search = String(args.search || "");
+        const replace = String(args.replace || "");
+        if (!search) {
+          return { ok: false, path: filePath, error: "Empty search string" };
+        }
+        const replaced = args.replaceAll ? source.split(search).join(replace) : source.replace(search, replace);
+        if (replaced === source) {
+          return { ok: false, path: filePath, error: "Search string not found" };
+        }
+        fs.writeFileSync(filePath, replaced, "utf8");
+        return { ok: true, path: filePath, changed: true };
+      }
+      default:
+        return { ok: false, error: `Unknown local tool: ${name}` };
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      error: error && error.message ? error.message : String(error),
+    };
+  }
+}
+
+function emitTextChunks(res, text) {
+  if (!text) {
+    return;
+  }
+  emitSse(res, "text", { chunk: text });
+}
+
+function emitToolLifecycle(res, toolCallId, toolName, args, result) {
+  emitSse(res, "tool_call_streaming_start", { toolCallId, toolName });
+  emitSse(res, "tool_call_delta", { toolCallId, argsTextDelta: JSON.stringify(args) });
+  emitSse(res, "tool_result", { toolCallId, result });
+}
+
+function nativeToolCallsFromMessage(message) {
+  if (!Array.isArray(message?.tool_calls)) {
+    return [];
+  }
+  return message.tool_calls
+    .map((toolCall) => {
+      const functionName = toolCall?.function?.name;
+      const argumentsText = toolCall?.function?.arguments || "{}";
+      try {
+        return {
+          toolCallId: toolCall.id || `call_${Date.now()}`,
+          toolName: functionName,
+          args: JSON.parse(argumentsText),
+        };
+      } catch (error) {
+        return {
+          toolCallId: toolCall.id || `call_${Date.now()}`,
+          toolName: functionName,
+          args: {},
+          parseError: error && error.message ? error.message : String(error),
+        };
+      }
+    })
+    .filter((toolCall) => toolCall.toolName);
+}
+
+function fallbackToolCallsFromText(text) {
+  const parsed = extractInlineToolCalls(text);
+  return {
+    cleanedText: parsed.cleanedText,
+    calls: parsed.calls.map((toolCall, index) => {
+      if (toolCall.toolName === "container.exec") {
+        return {
+          toolCallId: `fallback_${Date.now()}_${index}`,
+          toolName: "exec_process",
+          args: {
+            cmd: toolCall.payload.cmd,
+            timeoutMs: toolCall.payload.timeout,
+          },
+        };
+      }
+      return {
+        toolCallId: `fallback_${Date.now()}_${index}`,
+        toolName: toolCall.toolName,
+        args: toolCall.payload,
+      };
+    }),
+  };
+}
+
+async function callCliProxyChat(runtime, payload) {
+  const upstreamResponse = await fetch(`${runtime.baseURL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${runtime.apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!upstreamResponse.ok) {
+    const errorBody = await upstreamResponse.text();
+    throw new Error(errorBody || `CLIProxyAPI upstream failed (${upstreamResponse.status})`);
+  }
+
+  return upstreamResponse.json();
+}
+
+function buildToolPayload(route, messages, slotOverride) {
+  let payload = {
+    model: route.model,
+    stream: false,
+    messages,
+    tools: localToolDefinitions(),
+    tool_choice: "auto",
+    parallel_tool_calls: false,
+  };
+  if (slotOverride) {
+    payload = deepMerge(payload, slotOverride);
+    payload.model = route.model;
+    payload.stream = false;
+    payload.messages = messages;
+    payload.tools = localToolDefinitions();
+    payload.tool_choice = "auto";
+    payload.parallel_tool_calls = false;
+  }
+  return payload;
+}
+
+async function proxyWorkerWithLocalTools(res, requestBody, runtime, route, slotOverride) {
+  const cwd = extractWorkingDirectory(requestBody);
+  let messages = withLocalToolPrompt(translateMessages(requestBody.messages), cwd);
+  let totalUsage = null;
+
+  for (let step = 0; step < 8; step += 1) {
+    const responseJson = await callCliProxyChat(runtime, buildToolPayload(route, messages, slotOverride));
+    const choice = responseJson?.choices?.[0] || {};
+    const assistantMessage = choice.message || {};
+    const rawText = normalizeMessageContent(assistantMessage.content);
+    const nativeCalls = nativeToolCallsFromMessage(assistantMessage);
+    const fallback = nativeCalls.length === 0 ? fallbackToolCallsFromText(rawText) : { cleanedText: rawText, calls: [] };
+    const visibleText = sanitizeAssistantContent(fallback.cleanedText || rawText);
+    totalUsage = mergeUsageTotals(totalUsage, responseJson.usage);
+
+    if (assistantMessage.reasoning_content) {
+      emitSse(res, "reasoning", {
+        details: [
+          {
+            type: "reasoning.text",
+            text: String(assistantMessage.reasoning_content),
+            format: "openai-compatible-v1",
+            index: 0,
+          },
+        ],
+      });
+    }
+
+    const calls = nativeCalls.length > 0 ? nativeCalls : fallback.calls;
+    if (calls.length > 0) {
+      if (nativeCalls.length > 0) {
+        messages.push({
+          role: "assistant",
+          content: visibleText || "",
+          tool_calls: assistantMessage.tool_calls,
+        });
+      }
+      if (nativeCalls.length === 0) {
+        const syntheticCalls = calls.map((call) => ({
+          id: call.toolCallId,
+          type: "function",
+          function: {
+            name: call.toolName,
+            arguments: JSON.stringify(call.args),
+          },
+        }));
+        messages.push({
+          role: "assistant",
+          content: visibleText || "",
+          tool_calls: syntheticCalls,
+        });
+      }
+      emitTextChunks(res, visibleText);
+
+      for (const call of calls) {
+        const result = call.parseError
+          ? { ok: false, error: call.parseError }
+          : await executeLocalTool(call.toolName, call.args, cwd);
+        emitToolLifecycle(res, call.toolCallId, call.toolName, call.args, result);
+        messages.push({
+          role: "tool",
+          tool_call_id: call.toolCallId,
+          content: JSON.stringify(result),
+        });
+      }
+
+      emitSse(res, "finish_step", {
+        finishReason: "tool_call",
+        isContinued: true,
+        usage: finishUsage(responseJson.usage),
+      });
+      continue;
+    }
+
+    emitTextChunks(res, visibleText || rawText);
+    emitSse(res, "finish_message", {
+      finishReason: choice.finish_reason || "stop",
+      usage: finishUsage(responseJson.usage),
+    });
+    if (totalUsage) {
+      emitSse(res, "usage", slateUsage(route.model, totalUsage));
+    }
+    return;
+  }
+
+  emitSse(res, "text", {
+    chunk: "Local proxy stopped after too many tool iterations.",
+  });
+  emitSse(res, "finish_message", {
+    finishReason: "length",
+    usage: finishUsage(totalUsage),
+  });
+  if (totalUsage) {
+    emitSse(res, "usage", slateUsage(route.model, totalUsage));
+  }
 }
 
 function chooseLocalRoute(requestBody) {
@@ -394,6 +1027,18 @@ async function proxyWorkerStream(req, res, rawBody) {
     messageCount: upstreamPayload.messages.length,
   });
 
+  if (Array.isArray(requestBody.toolNames) && requestBody.toolNames.length > 0) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      "access-control-allow-origin": "*",
+    });
+    await proxyWorkerWithLocalTools(res, requestBody, runtime, route, slotOverride);
+    res.end();
+    return;
+  }
+
   const upstreamResponse = await fetch(`${runtime.baseURL}/chat/completions`, {
     method: "POST",
     headers: {
@@ -470,6 +1115,10 @@ async function proxyWorkerStream(req, res, rawBody) {
     emitSse(res, "usage", slateUsage(route.model, lastUsage));
   }
 
+  emitSse(res, "finish_message", {
+    finishReason: "stop",
+    usage: finishUsage(lastUsage),
+  });
   res.end();
 }
 
