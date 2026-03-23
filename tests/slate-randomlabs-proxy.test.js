@@ -2,7 +2,10 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  appendStreamToolCallDelta,
+  collectLiveToolCallEvents,
   compactSlateMessages,
+  normalizeSlateToolCall,
   recentWindowStart,
   shouldRetryUpstreamRequest,
   transportCandidates,
@@ -122,4 +125,120 @@ test("shouldRetryUpstreamRequest retries empty-stream style failures", () => {
     true
   );
   assert.equal(shouldRetryUpstreamRequest(401, "unauthorized"), false);
+});
+
+test("collectLiveToolCallEvents emits streaming start and argument deltas", () => {
+  const toolCalls = [];
+  const state = {
+    startedIndexes: new Set(),
+    emittedArgLengths: new Map(),
+  };
+
+  appendStreamToolCallDelta(toolCalls, [
+    {
+      index: 0,
+      id: "call_1",
+      function: {
+        name: "orchestrate",
+        arguments: '{"code":"con',
+      },
+    },
+  ]);
+
+  assert.deepEqual(collectLiveToolCallEvents(toolCalls, state), [
+    {
+      event: "tool_call_streaming_start",
+      payload: { toolCallId: "call_1", toolName: "orchestrate" },
+    },
+    {
+      event: "tool_call_delta",
+      payload: { toolCallId: "call_1", argsTextDelta: '{"code":"con' },
+    },
+  ]);
+
+  appendStreamToolCallDelta(toolCalls, [
+    {
+      index: 0,
+      function: {
+        arguments: 'sole.log(1)"}',
+      },
+    },
+  ]);
+
+  assert.deepEqual(collectLiveToolCallEvents(toolCalls, state), [
+    {
+      event: "tool_call_delta",
+      payload: { toolCallId: "call_1", argsTextDelta: 'sole.log(1)"}' },
+    },
+  ]);
+});
+
+test("collectLiveToolCallEvents buffers argument text until a tool call id is known", () => {
+  const toolCalls = [];
+  const state = {
+    startedIndexes: new Set(),
+    emittedArgLengths: new Map(),
+  };
+
+  appendStreamToolCallDelta(toolCalls, [
+    {
+      index: 0,
+      function: {
+        arguments: '{"code":"pending"}',
+      },
+    },
+  ]);
+
+  assert.deepEqual(collectLiveToolCallEvents(toolCalls, state), []);
+
+  appendStreamToolCallDelta(toolCalls, [
+    {
+      index: 0,
+      id: "call_2",
+      function: {
+        name: "orchestrate",
+      },
+    },
+  ]);
+
+  assert.deepEqual(collectLiveToolCallEvents(toolCalls, state), [
+    {
+      event: "tool_call_streaming_start",
+      payload: { toolCallId: "call_2", toolName: "orchestrate" },
+    },
+    {
+      event: "tool_call_delta",
+      payload: { toolCallId: "call_2", argsTextDelta: '{"code":"pending"}' },
+    },
+  ]);
+});
+
+test("normalizeSlateToolCall can require streamed argument text before emitting a final tool call", () => {
+  assert.equal(
+    normalizeSlateToolCall(
+      {
+        id: "call_3",
+        toolName: "orchestrate",
+        argsText: "",
+      },
+      { requireArgsText: true }
+    ),
+    null
+  );
+
+  assert.deepEqual(
+    normalizeSlateToolCall(
+      {
+        id: "call_3",
+        toolName: "orchestrate",
+        argsText: '{"code":"return 1;"}',
+      },
+      { requireArgsText: true }
+    ),
+    {
+      id: "call_3",
+      tool: "orchestrate",
+      args: { code: "return 1;" },
+    }
+  );
 });

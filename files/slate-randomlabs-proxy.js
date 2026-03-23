@@ -774,19 +774,60 @@ function appendStreamToolCallDelta(toolCalls, deltaToolCalls) {
   }
 }
 
-function normalizeSlateToolCalls(toolCalls) {
-  const normalized = [];
-  for (const toolCall of toolCalls) {
-    if (!toolCall || !toolCall.toolName) {
+function collectLiveToolCallEvents(toolCalls, state) {
+  const events = [];
+  const startedIndexes = state?.startedIndexes || new Set();
+  const emittedArgLengths = state?.emittedArgLengths || new Map();
+
+  for (let index = 0; index < toolCalls.length; index += 1) {
+    const toolCall = toolCalls[index];
+    if (!toolCall || !toolCall.id) {
       continue;
     }
 
-    let args = {};
-    const rawArgs = String(toolCall.argsText || "").trim();
-    if (rawArgs) {
-      try {
-        args = JSON.parse(rawArgs);
-      } catch (error) {
+    if (toolCall.toolName && !startedIndexes.has(index)) {
+      events.push({
+        event: "tool_call_streaming_start",
+        payload: {
+          toolCallId: String(toolCall.id),
+          toolName: String(toolCall.toolName),
+        },
+      });
+      startedIndexes.add(index);
+    }
+
+    const argsText = typeof toolCall.argsText === "string" ? toolCall.argsText : "";
+    const emittedArgLength = emittedArgLengths.get(index) || 0;
+    if (argsText.length > emittedArgLength) {
+      events.push({
+        event: "tool_call_delta",
+        payload: {
+          toolCallId: String(toolCall.id),
+          argsTextDelta: argsText.slice(emittedArgLength),
+        },
+      });
+      emittedArgLengths.set(index, argsText.length);
+    }
+  }
+
+  return events;
+}
+
+function normalizeSlateToolCall(toolCall, options) {
+  if (!toolCall || !toolCall.toolName) {
+    return null;
+  }
+
+  let args = {};
+  const rawArgs = String(toolCall.argsText || "").trim();
+  if (!rawArgs && options?.requireArgsText) {
+    return null;
+  }
+  if (rawArgs) {
+    try {
+      args = JSON.parse(rawArgs);
+    } catch (error) {
+      if (options?.logParseWarning) {
         appendJson({
           time: now(),
           type: "tool-call-parse-warning",
@@ -796,13 +837,24 @@ function normalizeSlateToolCalls(toolCalls) {
           message: error && error.message ? error.message : String(error),
         });
       }
+      return null;
     }
+  }
 
-    normalized.push({
-      id: toolCall.id || null,
-      tool: toolCall.toolName,
-      args,
-    });
+  return {
+    id: toolCall.id || null,
+    tool: toolCall.toolName,
+    args,
+  };
+}
+
+function normalizeSlateToolCalls(toolCalls, options) {
+  const normalized = [];
+  for (const toolCall of toolCalls) {
+    const parsed = normalizeSlateToolCall(toolCall, options);
+    if (parsed) {
+      normalized.push(parsed);
+    }
   }
 
   return normalized;
@@ -834,6 +886,32 @@ function emitSlateToolCalls(res, toolCalls) {
       tool: toolCall.tool,
       args: toolCall.args,
     });
+    emitted += 1;
+  }
+
+  return emitted;
+}
+
+function emitReadySlateToolCalls(res, toolCalls, emittedIndexes) {
+  let emitted = 0;
+
+  for (let index = 0; index < toolCalls.length; index += 1) {
+    if (emittedIndexes.has(index)) {
+      continue;
+    }
+    const normalized = normalizeSlateToolCall(toolCalls[index], {
+      logParseWarning: false,
+      requireArgsText: true,
+    });
+    if (!normalized) {
+      continue;
+    }
+    emitSse(res, "tool_call", {
+      id: normalized.id || `call_${Date.now()}_${index}`,
+      tool: normalized.tool,
+      args: normalized.args,
+    });
+    emittedIndexes.add(index);
     emitted += 1;
   }
 
@@ -1117,6 +1195,12 @@ async function proxyWorkerStream(req, res, rawBody) {
   let lastUsage = null;
   let finishReason = "stop";
   const toolCalls = [];
+  const liveToolCallState = {
+    startedIndexes: new Set(),
+    emittedArgLengths: new Map(),
+  };
+  const emittedToolCallIndexes = new Set();
+  let emittedToolCallCount = 0;
   let sawVisibleText = false;
 
   while (true) {
@@ -1173,6 +1257,10 @@ async function proxyWorkerStream(req, res, rawBody) {
 
       if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
         appendStreamToolCallDelta(toolCalls, delta.tool_calls);
+        for (const event of collectLiveToolCallEvents(toolCalls, liveToolCallState)) {
+          emitSse(res, event.event, event.payload);
+        }
+        emittedToolCallCount += emitReadySlateToolCalls(res, toolCalls, emittedToolCallIndexes);
       }
 
       if (chunk.usage) {
@@ -1181,7 +1269,7 @@ async function proxyWorkerStream(req, res, rawBody) {
     }
   }
 
-  const normalizedToolCalls = normalizeSlateToolCalls(toolCalls);
+  const normalizedToolCalls = normalizeSlateToolCalls(toolCalls, { logParseWarning: true });
   const terminalMessage = terminalToolMessage(normalizedToolCalls);
 
   // Slate's UI hides end_turn/message tool payloads, so surface the final
@@ -1190,7 +1278,17 @@ async function proxyWorkerStream(req, res, rawBody) {
     emitSse(res, "text", { chunk: terminalMessage });
   }
 
-  const emittedToolCallCount = emitSlateToolCalls(res, normalizedToolCalls);
+  const remainingToolCalls = [];
+  for (let index = 0; index < toolCalls.length; index += 1) {
+    if (emittedToolCallIndexes.has(index)) {
+      continue;
+    }
+    const normalized = normalizeSlateToolCall(toolCalls[index], { logParseWarning: true });
+    if (normalized) {
+      remainingToolCalls.push(normalized);
+    }
+  }
+  emittedToolCallCount += emitSlateToolCalls(res, remainingToolCalls);
 
   if (lastUsage) {
     emitSse(res, "usage", slateUsage(route.model, lastUsage));
@@ -1454,9 +1552,12 @@ if (require.main === module) {
 }
 
 module.exports = {
+  appendStreamToolCallDelta,
   assistantTextFromSlateMessage,
+  collectLiveToolCallEvents,
   compactSlateMessages,
   limitText,
+  normalizeSlateToolCall,
   recentWindowStart,
   shouldRetryUpstreamRequest,
   terminalToolMessage,
