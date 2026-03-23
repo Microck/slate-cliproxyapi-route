@@ -716,25 +716,81 @@ function emitTextChunks(res, text) {
   emitSse(res, "text", { chunk: text });
 }
 
-function compactToolResultForSse(result) {
-  const maxLength = 12000;
-  let text = "";
-  if (typeof result === "string") {
-    text = result;
-  } else {
-    try {
-      text = JSON.stringify(result);
-    } catch (error) {
-      text = JSON.stringify({
-        ok: false,
-        error: error && error.message ? error.message : String(error),
-      });
-    }
-  }
+function previewText(value, maxLength = 240) {
+  const text = String(value || "");
   if (text.length <= maxLength) {
     return text;
   }
-  return `${text.slice(0, maxLength)}\n...[truncated]`;
+  return `${text.slice(0, maxLength)}...[truncated]`;
+}
+
+function summarizeToolResult(result) {
+  if (result == null) {
+    return { ok: true };
+  }
+  if (typeof result === "string") {
+    return {
+      ok: true,
+      textPreview: previewText(result),
+      textLength: result.length,
+    };
+  }
+  if (!isPlainObject(result)) {
+    return { ok: true, value: result };
+  }
+
+  const summary = {};
+  if ("ok" in result) {
+    summary.ok = Boolean(result.ok);
+  }
+  if ("path" in result) {
+    summary.path = result.path;
+  }
+  if ("exitCode" in result) {
+    summary.exitCode = result.exitCode;
+  }
+  if ("timedOut" in result) {
+    summary.timedOut = Boolean(result.timedOut);
+  }
+  if ("signal" in result && result.signal) {
+    summary.signal = result.signal;
+  }
+  if ("bytes" in result) {
+    summary.bytes = result.bytes;
+  }
+  if ("changed" in result) {
+    summary.changed = Boolean(result.changed);
+  }
+  if ("error" in result && result.error) {
+    summary.error = previewText(result.error);
+  }
+  if ("stderr" in result && result.stderr) {
+    summary.stderrPreview = previewText(result.stderr);
+  }
+  if ("stdout" in result && result.stdout) {
+    summary.stdoutPreview = previewText(result.stdout);
+    summary.stdoutLength = String(result.stdout).length;
+  }
+  if ("content" in result && typeof result.content === "string") {
+    summary.contentPreview = previewText(result.content);
+    summary.contentLength = result.content.length;
+  }
+  if (Array.isArray(result.entries)) {
+    summary.entryCount = result.entries.length;
+    summary.entriesPreview = result.entries.slice(0, 10);
+  }
+  return summary;
+}
+
+function compactToolResultForSse(result) {
+  try {
+    return JSON.stringify(summarizeToolResult(result));
+  } catch (error) {
+    return JSON.stringify({
+      ok: false,
+      error: error && error.message ? error.message : String(error),
+    });
+  }
 }
 
 function emitToolLifecycle(res, toolCallId, toolName, args, result) {
