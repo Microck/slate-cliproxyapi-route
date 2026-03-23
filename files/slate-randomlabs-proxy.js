@@ -556,9 +556,8 @@ function appendStreamToolCallDelta(toolCalls, deltaToolCalls) {
   }
 }
 
-function emitSlateToolCalls(res, toolCalls) {
-  let emitted = 0;
-
+function normalizeSlateToolCalls(toolCalls) {
+  const normalized = [];
   for (const toolCall of toolCalls) {
     if (!toolCall || !toolCall.toolName) {
       continue;
@@ -581,10 +580,41 @@ function emitSlateToolCalls(res, toolCalls) {
       }
     }
 
-    emitSse(res, "tool_call", {
-      id: toolCall.id || `call_${Date.now()}_${emitted}`,
+    normalized.push({
+      id: toolCall.id || null,
       tool: toolCall.toolName,
       args,
+    });
+  }
+
+  return normalized;
+}
+
+function terminalToolMessage(toolCalls) {
+  for (let index = toolCalls.length - 1; index >= 0; index -= 1) {
+    const toolCall = toolCalls[index];
+    if (!toolCall) {
+      continue;
+    }
+    if (toolCall.tool !== "end_turn" && toolCall.tool !== "message") {
+      continue;
+    }
+    if (typeof toolCall.args?.message === "string" && toolCall.args.message) {
+      return toolCall.args.message;
+    }
+  }
+
+  return "";
+}
+
+function emitSlateToolCalls(res, toolCalls) {
+  let emitted = 0;
+
+  for (const toolCall of toolCalls) {
+    emitSse(res, "tool_call", {
+      id: toolCall.id || `call_${Date.now()}_${emitted}`,
+      tool: toolCall.tool,
+      args: toolCall.args,
     });
     emitted += 1;
   }
@@ -806,6 +836,7 @@ async function proxyWorkerStream(req, res, rawBody) {
   let lastUsage = null;
   let finishReason = "stop";
   const toolCalls = [];
+  let sawVisibleText = false;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -854,6 +885,9 @@ async function proxyWorkerStream(req, res, rawBody) {
             : "";
       if (textChunk) {
         emitSse(res, "text", { chunk: textChunk });
+        if (textChunk.trim()) {
+          sawVisibleText = true;
+        }
       }
 
       if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
@@ -866,7 +900,16 @@ async function proxyWorkerStream(req, res, rawBody) {
     }
   }
 
-  const emittedToolCallCount = emitSlateToolCalls(res, toolCalls);
+  const normalizedToolCalls = normalizeSlateToolCalls(toolCalls);
+  const terminalMessage = terminalToolMessage(normalizedToolCalls);
+
+  // Slate's UI hides end_turn/message tool payloads, so surface the final
+  // answer as assistant text only when the model did not stream visible text.
+  if (!sawVisibleText && terminalMessage) {
+    emitSse(res, "text", { chunk: terminalMessage });
+  }
+
+  const emittedToolCallCount = emitSlateToolCalls(res, normalizedToolCalls);
 
   if (lastUsage) {
     emitSse(res, "usage", slateUsage(route.model, lastUsage));
