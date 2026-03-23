@@ -7,9 +7,28 @@ const https = require("https");
 const os = require("os");
 const path = require("path");
 const { TextDecoder } = require("util");
-const { Proxy } = require("http-mitm-proxy");
 
-const proxy = new Proxy();
+let ProxyImpl;
+try {
+  ({ Proxy: ProxyImpl } = require("http-mitm-proxy"));
+} catch (error) {
+  if (require.main === module) {
+    throw error;
+  }
+  ProxyImpl = class ProxyStub {
+    onError() {}
+    onRequest() {}
+    onRequestData() {}
+    onRequestEnd() {}
+    onResponse() {}
+    onResponseData() {}
+    onResponseEnd() {}
+    listen() {}
+    close() {}
+  };
+}
+
+const proxy = new ProxyImpl();
 const stateDir =
   process.env.SLATE_RANDOMLABS_PROXY_DIR ||
   path.join(os.homedir(), ".local", "share", "slate-randomlabs-proxy");
@@ -22,7 +41,10 @@ const localServerKeyPath = path.join(localServerDir, "key.pem");
 const port = Number(process.env.SLATE_RANDOMLABS_PROXY_PORT || "8899");
 const host = process.env.SLATE_RANDOMLABS_PROXY_HOST || "127.0.0.1";
 const localServerPort = Number(process.env.SLATE_RANDOMLABS_PROXY_LOCAL_PORT || "8898");
-const maxBodyBytes = Number(process.env.SLATE_RANDOMLABS_PROXY_MAX_BODY || String(2 * 1024 * 1024));
+const maxBodyBytes = Number(process.env.SLATE_RANDOMLABS_PROXY_MAX_BODY || String(8 * 1024 * 1024));
+const maxUpstreamPayloadChars = Number(
+  process.env.SLATE_RANDOMLABS_PROXY_MAX_UPSTREAM_CHARS || "450000"
+);
 const defaultSlateConfigPath = path.join(os.homedir(), ".config", "slate", "slate.json");
 const localHttpsAgent = new https.Agent({ rejectUnauthorized: false });
 
@@ -385,10 +407,57 @@ function textPartText(part) {
   return "";
 }
 
-function translateUserFacingContent(content) {
+function limitText(text, maxChars, label) {
+  if (typeof text !== "string") {
+    return "";
+  }
+  if (!Number.isFinite(maxChars) || maxChars <= 0 || text.length <= maxChars) {
+    return text;
+  }
+  const headChars = Math.max(0, maxChars - 96);
+  const suffix = `\n\n[${label || "content"} truncated to keep Slate transport within limits]`;
+  return `${text.slice(0, headChars)}${suffix}`;
+}
+
+function truncateTranslatedContent(content, maxChars) {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) {
+    return content;
+  }
+
+  if (typeof content === "string") {
+    return limitText(content, maxChars, "message");
+  }
+
+  if (!Array.isArray(content)) {
+    return content;
+  }
+
+  let remaining = maxChars;
+  const truncated = [];
+
+  for (const part of content) {
+    if (!part || typeof part !== "object") {
+      continue;
+    }
+    if (part.type !== "text" || typeof part.text !== "string") {
+      truncated.push(part);
+      continue;
+    }
+    if (remaining <= 0) {
+      break;
+    }
+    const limitedText = limitText(part.text, remaining, "message");
+    truncated.push({ ...part, text: limitedText });
+    remaining -= limitedText.length;
+  }
+
+  return truncated;
+}
+
+function translateUserFacingContent(content, options) {
   const parts = contentParts(content);
   if (parts.length === 0) {
-    return normalizeMessageContent(content);
+    return truncateTranslatedContent(normalizeMessageContent(content), options?.textMaxChars);
   }
 
   const translated = [];
@@ -411,12 +480,15 @@ function translateUserFacingContent(content) {
   }
 
   if (translated.length === 0) {
-    return normalizeMessageContent(content);
+    return truncateTranslatedContent(normalizeMessageContent(content), options?.textMaxChars);
   }
   if (!hasRichParts) {
-    return translated.map((part) => part.text).join("\n");
+    return truncateTranslatedContent(
+      translated.map((part) => part.text).join("\n"),
+      options?.textMaxChars
+    );
   }
-  return translated;
+  return truncateTranslatedContent(translated, options?.textMaxChars);
 }
 
 function assistantToolCallsFromContent(content) {
@@ -455,7 +527,14 @@ function assistantToolCallsFromContent(content) {
   return toolCalls;
 }
 
-function toolMessagesFromSlateMessage(message) {
+function assistantTextFromSlateMessage(message, options) {
+  const content = sanitizeAssistantContent(
+    contentParts(message.content).map(textPartText).filter(Boolean).join("\n")
+  );
+  return limitText(content, options?.textMaxChars, "assistant message");
+}
+
+function toolMessagesFromSlateMessage(message, options) {
   const translated = [];
 
   for (const part of contentParts(message.content)) {
@@ -470,14 +549,14 @@ function toolMessagesFromSlateMessage(message) {
     translated.push({
       role: "tool",
       tool_call_id: String(part.tool_call_id),
-      content: result,
+      content: limitText(result, options?.toolResultMaxChars, "tool result"),
     });
   }
 
   return translated;
 }
 
-function translateMessages(messages) {
+function translateMessages(messages, options) {
   const translated = [];
 
   for (const message of messages || []) {
@@ -486,7 +565,7 @@ function translateMessages(messages) {
     }
 
     if (message.role === "system" || message.role === "user") {
-      const content = translateUserFacingContent(message.content);
+      const content = translateUserFacingContent(message.content, options);
       if (Array.isArray(content) ? content.length > 0 : Boolean(content)) {
         translated.push({ role: message.role, content });
       }
@@ -494,16 +573,14 @@ function translateMessages(messages) {
     }
 
     if (message.role === "assistant") {
-      const content = sanitizeAssistantContent(
-        contentParts(message.content).map(textPartText).filter(Boolean).join("\n")
-      );
+      const content = assistantTextFromSlateMessage(message, options);
       const toolCalls = assistantToolCallsFromContent(message.content);
       if (content || toolCalls.length > 0) {
         const assistantMessage = { role: "assistant" };
         if (content) {
           assistantMessage.content = content;
         }
-        if (toolCalls.length > 0) {
+        if (toolCalls.length > 0 && !options?.dropAssistantToolCalls) {
           assistantMessage.tool_calls = toolCalls;
         }
         translated.push(assistantMessage);
@@ -512,11 +589,152 @@ function translateMessages(messages) {
     }
 
     if (message.role === "tool_response") {
-      translated.push(...toolMessagesFromSlateMessage(message));
+      if (!options?.dropToolResponses) {
+        translated.push(...toolMessagesFromSlateMessage(message, options));
+      }
     }
   }
 
   return translated;
+}
+
+function recentWindowStart(messages, keepRecentMessages) {
+  let start = Math.max(0, (messages || []).length - Math.max(1, keepRecentMessages || 1));
+  while (start > 0 && messages[start]?.role === "tool_response") {
+    start -= 1;
+  }
+  return start;
+}
+
+function compactSlateMessages(messages, options) {
+  const start = recentWindowStart(messages || [], options?.keepRecentMessages || 12);
+  const compacted = [];
+  let omittedToolTraffic = false;
+  let omittedCount = 0;
+
+  for (const message of (messages || []).slice(0, start)) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+
+    if (message.role === "system" || message.role === "user") {
+      const content = translateUserFacingContent(message.content, {
+        textMaxChars: options?.oldTextMaxChars,
+      });
+      if (Array.isArray(content) ? content.length > 0 : Boolean(content)) {
+        compacted.push({ role: message.role, content });
+      }
+      continue;
+    }
+
+    if (message.role === "assistant") {
+      const content = assistantTextFromSlateMessage(message, {
+        textMaxChars: options?.oldTextMaxChars,
+      });
+      if (content) {
+        compacted.push({ role: "assistant", content });
+      }
+      if (assistantToolCallsFromContent(message.content).length > 0) {
+        omittedToolTraffic = true;
+      }
+      continue;
+    }
+
+    if (message.role === "tool_response") {
+      omittedToolTraffic = true;
+      omittedCount += 1;
+    }
+  }
+
+  if (omittedToolTraffic) {
+    compacted.push({
+      role: "system",
+      content:
+        "Earlier intermediate Slate tool calls and tool outputs were compacted for transport. Use the recent messages as the canonical working state.",
+    });
+  }
+
+  const recent = translateMessages((messages || []).slice(start), {
+    textMaxChars: options?.recentTextMaxChars,
+    toolResultMaxChars: options?.recentToolResultMaxChars,
+  });
+  compacted.push(...recent);
+
+  return {
+    messages: compacted,
+    meta: {
+      recentStart: start,
+      omittedToolTraffic,
+      omittedCount,
+    },
+  };
+}
+
+function transportCandidates(messages, options) {
+  const strategies = [
+    {
+      name: "full",
+      mode: "exact",
+    },
+    {
+      name: "trimmed-full",
+      mode: "exact",
+      textMaxChars: 24000,
+      toolResultMaxChars: 24000,
+    },
+    {
+      name: "compact-18",
+      mode: "compact",
+      keepRecentMessages: 18,
+      oldTextMaxChars: 2000,
+      recentTextMaxChars: 12000,
+      recentToolResultMaxChars: 16000,
+    },
+    {
+      name: "compact-12",
+      mode: "compact",
+      keepRecentMessages: 12,
+      oldTextMaxChars: 1200,
+      recentTextMaxChars: 8000,
+      recentToolResultMaxChars: 10000,
+    },
+    {
+      name: "compact-8",
+      mode: "compact",
+      keepRecentMessages: 8,
+      oldTextMaxChars: 800,
+      recentTextMaxChars: 4000,
+      recentToolResultMaxChars: 6000,
+    },
+  ];
+
+  return strategies.map((strategy) => {
+    const built =
+      strategy.mode === "compact"
+        ? compactSlateMessages(messages, strategy)
+        : { messages: translateMessages(messages, strategy), meta: {} };
+    const payloadChars = JSON.stringify({ messages: built.messages }).length;
+    return {
+      ...strategy,
+      messages: built.messages,
+      payloadChars,
+      withinLimit: payloadChars <= (options?.maxPayloadChars || maxUpstreamPayloadChars),
+      meta: built.meta || {},
+    };
+  });
+}
+
+function shouldRetryUpstreamRequest(status, errorBody) {
+  if (status === 401 || status === 403) {
+    return false;
+  }
+
+  const body = String(errorBody || "").toLowerCase();
+  if (status === 408 || status === 413 || status === 429 || status >= 500) {
+    return true;
+  }
+
+  return /empty_stream|context|payload|too large|length|timeout|server_error/.test(body);
 }
 
 function finishUsage(usage) {
@@ -740,6 +958,30 @@ function emitSse(res, event, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+function buildUpstreamPayload(route, runtime, slateTools, candidate) {
+  let upstreamPayload = {
+    model: route.model,
+    stream: true,
+    messages: candidate.messages,
+  };
+
+  const slotOverride = runtime.slotRequestOverrides[route.slot] || null;
+  if (slotOverride) {
+    upstreamPayload = deepMerge(upstreamPayload, slotOverride);
+    upstreamPayload.model = route.model;
+    upstreamPayload.stream = true;
+    upstreamPayload.messages = candidate.messages;
+  }
+
+  if (slateTools.length > 0) {
+    upstreamPayload.tools = slateTools;
+    upstreamPayload.tool_choice = "auto";
+    upstreamPayload.parallel_tool_calls = false;
+  }
+
+  return { upstreamPayload, slotOverride };
+}
+
 function slateUsage(localModel, usage) {
   return {
     model: `cliproxyapi/${localModel}`,
@@ -775,24 +1017,14 @@ async function proxyWorkerStream(req, res, rawBody) {
   }
 
   const route = chooseLocalRoute(requestBody);
-  const slotOverride = runtime.slotRequestOverrides[route.slot] || null;
   const slateTools = slateAgentToolDefinitions(requestBody.toolNames);
-  let upstreamPayload = {
-    model: route.model,
-    stream: true,
-    messages: translateMessages(requestBody.messages),
-  };
-  if (slotOverride) {
-    upstreamPayload = deepMerge(upstreamPayload, slotOverride);
-    upstreamPayload.model = route.model;
-    upstreamPayload.stream = true;
-    upstreamPayload.messages = translateMessages(requestBody.messages);
-  }
-  if (slateTools.length > 0) {
-    upstreamPayload.tools = slateTools;
-    upstreamPayload.tool_choice = "auto";
-    upstreamPayload.parallel_tool_calls = false;
-  }
+  const candidates = transportCandidates(requestBody.messages, {
+    maxPayloadChars: maxUpstreamPayloadChars,
+  });
+  const firstWithinLimit = candidates.findIndex((candidate) => candidate.withinLimit);
+  const startIndex = firstWithinLimit === -1 ? candidates.length - 1 : firstWithinLimit;
+  let upstreamResponse = null;
+  let upstreamFailure = null;
 
   appendJson({
     time: now(),
@@ -802,24 +1034,73 @@ async function proxyWorkerStream(req, res, rawBody) {
     localModel: route.model,
     sessionId: requestBody.sessionId || null,
     reasoningBudget: requestBody.reasoningBudget ?? null,
-    slotOverride,
     toolNames: requestBody.toolNames || [],
-    messageCount: upstreamPayload.messages.length,
+    sourceMessageCount: (requestBody.messages || []).length,
+    transportCandidates: candidates.map((candidate) => ({
+      name: candidate.name,
+      mode: candidate.mode,
+      payloadChars: candidate.payloadChars,
+      withinLimit: candidate.withinLimit,
+      messageCount: candidate.messages.length,
+      meta: candidate.meta,
+    })),
   });
 
-  const upstreamResponse = await fetch(`${runtime.baseURL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${runtime.apiKey}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(upstreamPayload),
-  });
+  for (let index = startIndex; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    const built = buildUpstreamPayload(route, runtime, slateTools, candidate);
 
-  if (!upstreamResponse.ok || !upstreamResponse.body) {
-    const errorBody = await upstreamResponse.text();
+    appendJson({
+      time: now(),
+      type: "upstream-attempt",
+      slot: route.slot,
+      strategy: candidate.name,
+      mode: candidate.mode,
+      payloadChars: candidate.payloadChars,
+      messageCount: candidate.messages.length,
+      slotOverride: built.slotOverride,
+    });
+
+    upstreamResponse = await fetch(`${runtime.baseURL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${runtime.apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(built.upstreamPayload),
+    });
+
+    if (upstreamResponse.ok && upstreamResponse.body) {
+      upstreamFailure = null;
+      break;
+    }
+
+    const errorBody = upstreamResponse ? await upstreamResponse.text() : "";
+    upstreamFailure = {
+      status: upstreamResponse?.status || 502,
+      body: errorBody,
+    };
+    appendJson({
+      time: now(),
+      type: "upstream-attempt-failed",
+      slot: route.slot,
+      strategy: candidate.name,
+      mode: candidate.mode,
+      status: upstreamFailure.status,
+      body: limitText(errorBody, 4000, "upstream error"),
+    });
+
+    if (index === candidates.length - 1 || !shouldRetryUpstreamRequest(upstreamFailure.status, errorBody)) {
+      break;
+    }
+  }
+
+  if (!upstreamResponse || !upstreamResponse.ok || !upstreamResponse.body) {
     res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
-    res.end(errorBody || `CLIProxyAPI upstream failed (${upstreamResponse.status})`);
+    res.end(
+      (upstreamFailure && upstreamFailure.body) ||
+        `CLIProxyAPI upstream failed (${upstreamFailure?.status || upstreamResponse?.status || 502})`
+    );
     return;
   }
 
@@ -1134,34 +1415,51 @@ proxy.onResponseEnd((ctx, callback) => {
   callback();
 });
 
-const localServer = startLocalServer();
+function main() {
+  const localServer = startLocalServer();
 
-proxy.listen({
-  port,
-  host,
-  sslCaDir,
-  forceSNI: true,
-});
+  proxy.listen({
+    port,
+    host,
+    sslCaDir,
+    forceSNI: true,
+  });
 
-appendJson({
-  time: now(),
-  type: "startup",
-  port,
-  host,
-  stateDir,
-  sslCaDir,
-});
+  appendJson({
+    time: now(),
+    type: "startup",
+    port,
+    host,
+    stateDir,
+    sslCaDir,
+  });
 
-process.on("SIGINT", () => {
-  appendJson({ time: now(), type: "shutdown", signal: "SIGINT" });
-  localServer.close();
-  proxy.close();
-  process.exit(0);
-});
+  process.on("SIGINT", () => {
+    appendJson({ time: now(), type: "shutdown", signal: "SIGINT" });
+    localServer.close();
+    proxy.close();
+    process.exit(0);
+  });
 
-process.on("SIGTERM", () => {
-  appendJson({ time: now(), type: "shutdown", signal: "SIGTERM" });
-  localServer.close();
-  proxy.close();
-  process.exit(0);
-});
+  process.on("SIGTERM", () => {
+    appendJson({ time: now(), type: "shutdown", signal: "SIGTERM" });
+    localServer.close();
+    proxy.close();
+    process.exit(0);
+  });
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  assistantTextFromSlateMessage,
+  compactSlateMessages,
+  limitText,
+  recentWindowStart,
+  shouldRetryUpstreamRequest,
+  terminalToolMessage,
+  translateMessages,
+  transportCandidates,
+};
