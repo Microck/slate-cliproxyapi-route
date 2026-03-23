@@ -363,17 +363,161 @@ function sanitizeAssistantContent(content) {
     .trim();
 }
 
+function contentParts(content) {
+  if (Array.isArray(content)) {
+    return content.filter((part) => part && typeof part === "object");
+  }
+  if (typeof content === "string" && content) {
+    return [{ type: "text", text: content }];
+  }
+  return [];
+}
+
+function textPartText(part) {
+  if (!part || typeof part !== "object") {
+    return "";
+  }
+  if (part.type === "text" && typeof part.text === "string") {
+    return part.text;
+  }
+  if (part.type === "object" && isPlainObject(part.content)) {
+    return JSON.stringify(part.content);
+  }
+  return "";
+}
+
+function translateUserFacingContent(content) {
+  const parts = contentParts(content);
+  if (parts.length === 0) {
+    return normalizeMessageContent(content);
+  }
+
+  const translated = [];
+  let hasRichParts = false;
+
+  for (const part of parts) {
+    if (part.type === "text" && typeof part.text === "string") {
+      translated.push({ type: "text", text: part.text });
+      continue;
+    }
+    if (part.type === "image_url" && isPlainObject(part.image_url) && typeof part.image_url.url === "string") {
+      hasRichParts = true;
+      translated.push({ type: "image_url", image_url: part.image_url });
+      continue;
+    }
+    const fallbackText = textPartText(part);
+    if (fallbackText) {
+      translated.push({ type: "text", text: fallbackText });
+    }
+  }
+
+  if (translated.length === 0) {
+    return normalizeMessageContent(content);
+  }
+  if (!hasRichParts) {
+    return translated.map((part) => part.text).join("\n");
+  }
+  return translated;
+}
+
+function assistantToolCallsFromContent(content) {
+  const toolCalls = [];
+
+  for (const part of contentParts(content)) {
+    if (part.type === "tool_call" && part.id && part.tool) {
+      toolCalls.push({
+        id: String(part.id),
+        type: "function",
+        function: {
+          name: String(part.tool),
+          arguments: JSON.stringify(part.args || {}),
+        },
+      });
+      continue;
+    }
+
+    if (part.type === "object" && part.id && isPlainObject(part.content)) {
+      const inner = part.content.tool && isPlainObject(part.content.tool)
+        ? part.content.tool
+        : part.content;
+      if (inner.tool) {
+        toolCalls.push({
+          id: String(part.id),
+          type: "function",
+          function: {
+            name: String(inner.tool),
+            arguments: JSON.stringify(inner.args || {}),
+          },
+        });
+      }
+    }
+  }
+
+  return toolCalls;
+}
+
+function toolMessagesFromSlateMessage(message) {
+  const translated = [];
+
+  for (const part of contentParts(message.content)) {
+    if (part.type !== "tool_response" || !part.tool_call_id) {
+      continue;
+    }
+    const result = part.result == null
+      ? ""
+      : typeof part.result === "string"
+        ? part.result
+        : JSON.stringify(part.result);
+    translated.push({
+      role: "tool",
+      tool_call_id: String(part.tool_call_id),
+      content: result,
+    });
+  }
+
+  return translated;
+}
+
 function translateMessages(messages) {
-  return (messages || [])
-    .filter((message) => ["system", "user", "assistant"].includes(message.role))
-    .map((message) => ({
-      role: message.role,
-      content:
-        message.role === "assistant"
-          ? sanitizeAssistantContent(normalizeMessageContent(message.content))
-          : normalizeMessageContent(message.content),
-    }))
-    .filter((message) => message.content);
+  const translated = [];
+
+  for (const message of messages || []) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+
+    if (message.role === "system" || message.role === "user") {
+      const content = translateUserFacingContent(message.content);
+      if (Array.isArray(content) ? content.length > 0 : Boolean(content)) {
+        translated.push({ role: message.role, content });
+      }
+      continue;
+    }
+
+    if (message.role === "assistant") {
+      const content = sanitizeAssistantContent(
+        contentParts(message.content).map(textPartText).filter(Boolean).join("\n")
+      );
+      const toolCalls = assistantToolCallsFromContent(message.content);
+      if (content || toolCalls.length > 0) {
+        const assistantMessage = { role: "assistant" };
+        if (content) {
+          assistantMessage.content = content;
+        }
+        if (toolCalls.length > 0) {
+          assistantMessage.tool_calls = toolCalls;
+        }
+        translated.push(assistantMessage);
+      }
+      continue;
+    }
+
+    if (message.role === "tool_response") {
+      translated.push(...toolMessagesFromSlateMessage(message));
+    }
+  }
+
+  return translated;
 }
 
 function extractWorkingDirectory(requestBody) {
@@ -852,6 +996,69 @@ function nativeToolCallsFromMessage(message) {
       }
     })
     .filter((toolCall) => toolCall.toolName);
+}
+
+function appendStreamToolCallDelta(toolCalls, deltaToolCalls) {
+  for (const deltaToolCall of deltaToolCalls || []) {
+    const index =
+      Number.isInteger(deltaToolCall?.index) && deltaToolCall.index >= 0
+        ? deltaToolCall.index
+        : toolCalls.length;
+    const current =
+      toolCalls[index] || {
+        id: "",
+        toolName: "",
+        argsText: "",
+      };
+
+    if (deltaToolCall?.id) {
+      current.id = String(deltaToolCall.id);
+    }
+    if (deltaToolCall?.function?.name) {
+      current.toolName = String(deltaToolCall.function.name);
+    }
+    if (typeof deltaToolCall?.function?.arguments === "string") {
+      current.argsText += deltaToolCall.function.arguments;
+    }
+
+    toolCalls[index] = current;
+  }
+}
+
+function emitSlateToolCalls(res, toolCalls) {
+  let emitted = 0;
+
+  for (const toolCall of toolCalls) {
+    if (!toolCall || !toolCall.toolName) {
+      continue;
+    }
+
+    let args = {};
+    const rawArgs = String(toolCall.argsText || "").trim();
+    if (rawArgs) {
+      try {
+        args = JSON.parse(rawArgs);
+      } catch (error) {
+        appendJson({
+          time: now(),
+          type: "tool-call-parse-warning",
+          toolCallId: toolCall.id || null,
+          toolName: toolCall.toolName,
+          argsText: rawArgs,
+          message: error && error.message ? error.message : String(error),
+        });
+      }
+    }
+
+    emitSse(res, "tool_call", {
+      id: toolCall.id || `call_${Date.now()}_${emitted}`,
+      tool: toolCall.toolName,
+      args,
+    });
+    emitted += 1;
+  }
+
+  return emitted;
 }
 
 function fallbackToolCallsFromText(text) {
@@ -1445,6 +1652,7 @@ async function proxyWorkerStream(req, res, rawBody) {
 
   const route = chooseLocalRoute(requestBody);
   const slotOverride = runtime.slotRequestOverrides[route.slot] || null;
+  const slateTools = slateAgentToolDefinitions(requestBody.toolNames);
   let upstreamPayload = {
     model: route.model,
     stream: true,
@@ -1456,6 +1664,11 @@ async function proxyWorkerStream(req, res, rawBody) {
     upstreamPayload.stream = true;
     upstreamPayload.messages = translateMessages(requestBody.messages);
   }
+  if (slateTools.length > 0) {
+    upstreamPayload.tools = slateTools;
+    upstreamPayload.tool_choice = "auto";
+    upstreamPayload.parallel_tool_calls = false;
+  }
 
   appendJson({
     time: now(),
@@ -1466,20 +1679,9 @@ async function proxyWorkerStream(req, res, rawBody) {
     sessionId: requestBody.sessionId || null,
     reasoningBudget: requestBody.reasoningBudget ?? null,
     slotOverride,
+    toolNames: requestBody.toolNames || [],
     messageCount: upstreamPayload.messages.length,
   });
-
-  if (Array.isArray(requestBody.toolNames) && requestBody.toolNames.length > 0) {
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-      "access-control-allow-origin": "*",
-    });
-    await proxyWorkerWithSlateTools(res, requestBody, runtime, route, slotOverride);
-    res.end();
-    return;
-  }
 
   const upstreamResponse = await fetch(`${runtime.baseURL}/chat/completions`, {
     method: "POST",
@@ -1508,6 +1710,8 @@ async function proxyWorkerStream(req, res, rawBody) {
   const decoder = new TextDecoder();
   let buffer = "";
   let lastUsage = null;
+  let finishReason = "stop";
+  const toolCalls = [];
 
   while (true) {
     const { value, done } = await reader.read();
@@ -1529,6 +1733,9 @@ async function proxyWorkerStream(req, res, rawBody) {
       const chunk = JSON.parse(dataLine);
       const choice = chunk.choices?.[0] || {};
       const delta = choice.delta || {};
+      if (choice.finish_reason) {
+        finishReason = choice.finish_reason;
+      }
 
       if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
         emitSse(res, "reasoning", {
@@ -1543,8 +1750,20 @@ async function proxyWorkerStream(req, res, rawBody) {
         });
       }
 
-      if (typeof delta.content === "string" && delta.content) {
-        emitSse(res, "text", { chunk: delta.content });
+      const textChunk =
+        typeof delta.content === "string"
+          ? delta.content
+          : Array.isArray(delta.content)
+            ? delta.content
+                .map((part) => (part?.type === "text" && typeof part.text === "string" ? part.text : ""))
+                .join("")
+            : "";
+      if (textChunk) {
+        emitSse(res, "text", { chunk: textChunk });
+      }
+
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+        appendStreamToolCallDelta(toolCalls, delta.tool_calls);
       }
 
       if (chunk.usage) {
@@ -1553,12 +1772,19 @@ async function proxyWorkerStream(req, res, rawBody) {
     }
   }
 
+  const emittedToolCallCount = emitSlateToolCalls(res, toolCalls);
+
   if (lastUsage) {
     emitSse(res, "usage", slateUsage(route.model, lastUsage));
   }
 
   emitSse(res, "finish_message", {
-    finishReason: "stop",
+    finishReason:
+      emittedToolCallCount > 0
+        ? "tool_call"
+        : finishReason === "tool_calls"
+          ? "tool_call"
+          : finishReason || "stop",
     usage: finishUsage(lastUsage),
   });
   res.end();
