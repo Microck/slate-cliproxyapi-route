@@ -602,14 +602,13 @@ function slateAgentToolDefinitions(toolNames) {
       function: {
         name: "orchestrate",
         description:
-          "Delegate a focused subtask to a local worker with filesystem, shell, grep, and edit capabilities. Use this for repo exploration, implementation, or verification.",
+          "Execute native Slate orchestration JavaScript for a focused subtask. Pass a `code` string that uses the provided `system` helpers rather than a natural-language task description.",
         parameters: {
           type: "object",
           properties: {
-            task: { type: "string" },
-            successCriteria: { type: "string" },
+            code: { type: "string" },
           },
-          required: ["task"],
+          required: ["code"],
         },
       },
     });
@@ -620,13 +619,13 @@ function slateAgentToolDefinitions(toolNames) {
       type: "function",
       function: {
         name: "view_tool_call",
-        description: "Inspect the stored result of a previous tool call by toolCallId.",
+        description: "Inspect the stored result of a previous tool call by tool_call_id.",
         parameters: {
           type: "object",
           properties: {
-            toolCallId: { type: "string" },
+            tool_call_id: { type: "string" },
           },
-          required: ["toolCallId"],
+          required: ["tool_call_id"],
         },
       },
     });
@@ -641,9 +640,9 @@ function slateAgentToolDefinitions(toolNames) {
         parameters: {
           type: "object",
           properties: {
-            response: { type: "string" },
+            message: { type: "string" },
           },
-          required: ["response"],
+          required: ["message"],
         },
       },
     });
