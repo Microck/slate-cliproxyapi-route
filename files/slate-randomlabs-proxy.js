@@ -716,10 +716,34 @@ function emitTextChunks(res, text) {
   emitSse(res, "text", { chunk: text });
 }
 
+function compactToolResultForSse(result) {
+  const maxLength = 12000;
+  let text = "";
+  if (typeof result === "string") {
+    text = result;
+  } else {
+    try {
+      text = JSON.stringify(result);
+    } catch (error) {
+      text = JSON.stringify({
+        ok: false,
+        error: error && error.message ? error.message : String(error),
+      });
+    }
+  }
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength)}\n...[truncated]`;
+}
+
 function emitToolLifecycle(res, toolCallId, toolName, args, result) {
   emitSse(res, "tool_call_streaming_start", { toolCallId, toolName });
   emitSse(res, "tool_call_delta", { toolCallId, argsTextDelta: JSON.stringify(args) });
-  emitSse(res, "tool_result", { toolCallId, result });
+  emitSse(res, "tool_result", {
+    toolCallId,
+    result: compactToolResultForSse(result),
+  });
 }
 
 function nativeToolCallsFromMessage(message) {
