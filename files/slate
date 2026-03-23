@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+proxy_port="${SLATE_RANDOMLABS_PROXY_PORT:-8899}"
+proxy_host="${SLATE_RANDOMLABS_PROXY_HOST:-127.0.0.1}"
+proxy_ca="/home/ubuntu/.local/share/slate-randomlabs-proxy/ca/certs/ca.pem"
+
+is_cliproxyapi_configured() {
+  if [ -n "${SLATE_CONFIG_CONTENT:-}" ] && printf '%s' "${SLATE_CONFIG_CONTENT}" | grep -Eq 'cliproxyapi'; then
+    return 0
+  fi
+  if [ -f "${SLATE_CONFIG}" ] && grep -Eq 'cliproxyapi' "${SLATE_CONFIG}"; then
+    return 0
+  fi
+  return 1
+}
+
+proxy_ready() {
+  (exec 3<>"/dev/tcp/${proxy_host}/${proxy_port}") >/dev/null 2>&1
+}
+
+start_proxy_if_needed() {
+  if proxy_ready; then
+    return 0
+  fi
+  nohup /home/ubuntu/.local/bin/slate-randomlabs-proxy >/tmp/slate-randomlabs-proxy.log 2>&1 &
+  for _ in $(seq 1 50); do
+    if proxy_ready && [ -f "${proxy_ca}" ]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+if [ -z "${SLATE_API_KEY:-}" ] && [ -f /home/ubuntu/.config/slate/slate-api-key ]; then
+  export SLATE_API_KEY="$(tr -d '\r\n' </home/ubuntu/.config/slate/slate-api-key)"
+fi
+if [ -z "${SLATE_API_KEY:-}" ]; then
+  unset SLATE_API_KEY
+fi
+export SLATE_CONFIG="${SLATE_CONFIG:-/home/ubuntu/.config/slate/slate.json}"
+
+allow_metadata=0
+for arg in "$@"; do
+  case "$arg" in
+    --help|-h|--version)
+      allow_metadata=1
+      ;;
+  esac
+done
+
+if [ "$allow_metadata" -ne 1 ] && is_cliproxyapi_configured; then
+  export SLATE_ALLOW_UNSUPPORTED_PROVIDER=1
+  if ! start_proxy_if_needed; then
+    cat >&2 <<'EOF'
+Failed to start the local Slate CLIProxyAPI reroute proxy.
+
+Expected:
+  proxy listener on 127.0.0.1:8899
+  CA certificate at ~/.local/share/slate-randomlabs-proxy/ca/certs/ca.pem
+EOF
+    exit 1
+  fi
+  export HTTPS_PROXY="http://${proxy_host}:${proxy_port}"
+  export HTTP_PROXY="http://${proxy_host}:${proxy_port}"
+  export SSL_CERT_FILE="${proxy_ca}"
+fi
+
+exec /home/ubuntu/.nvm/versions/node/v24.13.0/bin/slate "$@"
