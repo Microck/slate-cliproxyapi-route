@@ -358,7 +358,9 @@ function extractInlineToolCalls(input) {
 
 function sanitizeAssistantContent(content) {
   const { cleanedText } = extractInlineToolCalls(content);
-  return cleanedText;
+  return String(cleanedText || "")
+    .replace(/Local proxy stopped after too many tool iterations\.?/g, "")
+    .trim();
 }
 
 function translateMessages(messages) {
@@ -387,18 +389,22 @@ function extractWorkingDirectory(requestBody) {
   return match ? match[1].trim() : process.cwd();
 }
 
-function localToolSystemPrompt(cwd) {
+function workerToolSystemPrompt(cwd) {
   return [
-    "You are running behind a local compatibility layer that provides real filesystem and shell tools.",
+    "You are a focused execution worker running behind a local compatibility layer.",
     "Use the provided function tools whenever you need to inspect files, search code, run commands, or edit files.",
     'Never print raw tool invocations like `to=container.exec code=...` in normal text.',
     "If tools are needed, call the function tools directly instead of describing the call.",
+    "If the task requires code or file changes, do the minimum inspection needed, then make the edits and run validation.",
+    "Do not keep expanding repository inspection once the target files are clear.",
+    "Do the delegated task end-to-end, then stop. Avoid repeated re-reading of the same files unless necessary.",
+    "When you finish, return a concise summary with changed files, verification, and blockers if any.",
     `Current working directory: ${cwd}`,
   ].join("\n");
 }
 
-function withLocalToolPrompt(messages, cwd) {
-  const prompt = { role: "system", content: localToolSystemPrompt(cwd) };
+function withWorkerToolPrompt(messages, cwd) {
+  const prompt = { role: "system", content: workerToolSystemPrompt(cwd) };
   return [prompt, ...messages];
 }
 
@@ -761,6 +767,18 @@ function summarizeToolResult(result) {
   if ("changed" in result) {
     summary.changed = Boolean(result.changed);
   }
+  if ("summary" in result && result.summary) {
+    summary.summary = previewText(result.summary, 600);
+  }
+  if ("finishReason" in result && result.finishReason) {
+    summary.finishReason = result.finishReason;
+  }
+  if ("toolCallCount" in result) {
+    summary.toolCallCount = result.toolCallCount;
+  }
+  if (Array.isArray(result.changedFiles)) {
+    summary.changedFiles = result.changedFiles;
+  }
   if ("error" in result && result.error) {
     summary.error = previewText(result.error);
   }
@@ -794,8 +812,16 @@ function compactToolResultForSse(result) {
 }
 
 function emitToolLifecycle(res, toolCallId, toolName, args, result) {
+  emitToolCallStart(res, toolCallId, toolName, args);
+  emitToolResult(res, toolCallId, result);
+}
+
+function emitToolCallStart(res, toolCallId, toolName, args) {
   emitSse(res, "tool_call_streaming_start", { toolCallId, toolName });
   emitSse(res, "tool_call_delta", { toolCallId, argsTextDelta: JSON.stringify(args) });
+}
+
+function emitToolResult(res, toolCallId, result) {
   emitSse(res, "tool_result", {
     toolCallId,
     result: compactToolResultForSse(result),
@@ -870,9 +896,9 @@ async function callCliProxyChat(runtime, payload) {
   return upstreamResponse.json();
 }
 
-function buildToolPayload(route, messages, slotOverride) {
+function buildWorkerPayload(model, messages, slotOverride) {
   let payload = {
-    model: route.model,
+    model,
     stream: false,
     messages,
     tools: localToolDefinitions(),
@@ -881,7 +907,7 @@ function buildToolPayload(route, messages, slotOverride) {
   };
   if (slotOverride) {
     payload = deepMerge(payload, slotOverride);
-    payload.model = route.model;
+    payload.model = model;
     payload.stream = false;
     payload.messages = messages;
     payload.tools = localToolDefinitions();
@@ -891,13 +917,84 @@ function buildToolPayload(route, messages, slotOverride) {
   return payload;
 }
 
-async function proxyWorkerWithLocalTools(res, requestBody, runtime, route, slotOverride) {
-  const cwd = extractWorkingDirectory(requestBody);
-  let messages = withLocalToolPrompt(translateMessages(requestBody.messages), cwd);
-  let totalUsage = null;
+function buildWorkerSummaryPayload(model, messages, slotOverride) {
+  let payload = {
+    model,
+    stream: false,
+    messages,
+  };
+  if (slotOverride) {
+    payload = deepMerge(payload, slotOverride);
+    payload.model = model;
+    payload.stream = false;
+    payload.messages = messages;
+  }
+  return payload;
+}
 
-  for (let step = 0; step < 8; step += 1) {
-    const responseJson = await callCliProxyChat(runtime, buildToolPayload(route, messages, slotOverride));
+function collectChangedFiles(toolExecutions) {
+  const changed = new Set();
+  for (const execution of toolExecutions) {
+    if (!execution?.result?.ok) {
+      continue;
+    }
+    if (execution.toolName === "write_file" || execution.toolName === "replace_in_file") {
+      if (execution.result.path) {
+        changed.add(execution.result.path);
+      }
+    }
+  }
+  return Array.from(changed);
+}
+
+async function forceWorkerSummary(runtime, model, slotOverride, messages, toolExecutions) {
+  const changedFiles = collectChangedFiles(toolExecutions);
+  const summaryMessages = [
+    ...messages,
+    {
+      role: "system",
+      content: [
+        "You now have enough information from prior tool results.",
+        "Do not call any more tools.",
+        "Write the final delegated-task summary now.",
+        "Include changed files, verification, blockers, and whether more work is still required.",
+      ].join("\n"),
+    },
+  ];
+  const responseJson = await callCliProxyChat(
+    runtime,
+    buildWorkerSummaryPayload(model, summaryMessages, slotOverride)
+  );
+  const choice = responseJson?.choices?.[0] || {};
+  return {
+    text: sanitizeAssistantContent(normalizeMessageContent(choice.message?.content)) || "",
+    finishReason: choice.finish_reason || "stop",
+    usage: responseJson.usage || null,
+    toolExecutions,
+    changedFiles,
+  };
+}
+
+async function runLocalWorkerLoop({
+  runtime,
+  model,
+  slotOverride,
+  messages,
+  cwd,
+  taskText = "",
+  maxSteps = 24,
+}) {
+  let totalUsage = null;
+  const toolExecutions = [];
+  const taskRequiresChanges = /\b(add|build|change|complete|create|edit|fix|implement|make|modify|update|write)\b/i.test(
+    String(taskText || "")
+  );
+  const forceSummaryAfterSteps = taskRequiresChanges ? 10 : 8;
+  const forceSummaryAfterToolCalls = taskRequiresChanges ? 32 : 24;
+  let editNudgeInjected = false;
+
+  for (let step = 0; step < maxSteps; step += 1) {
+    const responseJson = await callCliProxyChat(runtime, buildWorkerPayload(model, messages, slotOverride));
     const choice = responseJson?.choices?.[0] || {};
     const assistantMessage = choice.message || {};
     const rawText = normalizeMessageContent(assistantMessage.content);
@@ -905,19 +1002,6 @@ async function proxyWorkerWithLocalTools(res, requestBody, runtime, route, slotO
     const fallback = nativeCalls.length === 0 ? fallbackToolCallsFromText(rawText) : { cleanedText: rawText, calls: [] };
     const visibleText = sanitizeAssistantContent(fallback.cleanedText || rawText);
     totalUsage = mergeUsageTotals(totalUsage, responseJson.usage);
-
-    if (assistantMessage.reasoning_content) {
-      emitSse(res, "reasoning", {
-        details: [
-          {
-            type: "reasoning.text",
-            text: String(assistantMessage.reasoning_content),
-            format: "openai-compatible-v1",
-            index: 0,
-          },
-        ],
-      });
-    }
 
     const calls = nativeCalls.length > 0 ? nativeCalls : fallback.calls;
     if (calls.length > 0) {
@@ -943,13 +1027,17 @@ async function proxyWorkerWithLocalTools(res, requestBody, runtime, route, slotO
           tool_calls: syntheticCalls,
         });
       }
-      emitTextChunks(res, visibleText);
 
       for (const call of calls) {
         const result = call.parseError
           ? { ok: false, error: call.parseError }
           : await executeLocalTool(call.toolName, call.args, cwd);
-        emitToolLifecycle(res, call.toolCallId, call.toolName, call.args, result);
+        toolExecutions.push({
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          args: call.args,
+          result,
+        });
         messages.push({
           role: "tool",
           tool_call_id: call.toolCallId,
@@ -957,27 +1045,301 @@ async function proxyWorkerWithLocalTools(res, requestBody, runtime, route, slotO
         });
       }
 
-      emitSse(res, "finish_step", {
-        finishReason: "tool_call",
-        isContinued: true,
-        usage: finishUsage(responseJson.usage),
-      });
+      const changedFiles = collectChangedFiles(toolExecutions);
+      if (taskRequiresChanges && changedFiles.length === 0 && !editNudgeInjected && step + 1 >= 4) {
+        messages.push({
+          role: "system",
+          content: [
+            "You have enough context now.",
+            "Stop broad inspection and make the required file edits immediately.",
+            "Use write/edit tools, then run validation commands, then finish.",
+            "Do not return another inspection-only pass.",
+          ].join("\n"),
+        });
+        editNudgeInjected = true;
+      }
+
+      if (
+        step + 1 >= forceSummaryAfterSteps ||
+        toolExecutions.length >= forceSummaryAfterToolCalls
+      ) {
+        const summaryResult = await forceWorkerSummary(
+          runtime,
+          model,
+          slotOverride,
+          messages,
+          toolExecutions
+        );
+        totalUsage = mergeUsageTotals(totalUsage, summaryResult.usage);
+        return {
+          text: summaryResult.text,
+          finishReason: summaryResult.finishReason,
+          usage: totalUsage,
+          toolExecutions,
+        };
+      }
       continue;
     }
 
-    emitTextChunks(res, visibleText || rawText);
-    emitSse(res, "finish_message", {
+    return {
+      text: visibleText || rawText,
       finishReason: choice.finish_reason || "stop",
+      usage: totalUsage,
+      toolExecutions,
+    };
+  }
+
+  return {
+    text: "Local worker stopped after too many tool iterations.",
+    finishReason: "length",
+    usage: totalUsage,
+    toolExecutions,
+  };
+}
+
+function slateAgentToolDefinitions(toolNames) {
+  const names = new Set(toolNames || []);
+  const tools = [];
+
+  if (names.has("orchestrate")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "orchestrate",
+        description:
+          "Delegate a focused subtask to a local worker with filesystem, shell, grep, and edit capabilities. Use this for repo exploration, implementation, or verification.",
+        parameters: {
+          type: "object",
+          properties: {
+            task: { type: "string" },
+            successCriteria: { type: "string" },
+          },
+          required: ["task"],
+        },
+      },
+    });
+  }
+
+  if (names.has("view_tool_call")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "view_tool_call",
+        description: "Inspect the stored result of a previous tool call by toolCallId.",
+        parameters: {
+          type: "object",
+          properties: {
+            toolCallId: { type: "string" },
+          },
+          required: ["toolCallId"],
+        },
+      },
+    });
+  }
+
+  if (names.has("end_turn")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "end_turn",
+        description: "Finish the turn and send the final user-facing response.",
+        parameters: {
+          type: "object",
+          properties: {
+            response: { type: "string" },
+          },
+          required: ["response"],
+        },
+      },
+    });
+  }
+
+  return tools;
+}
+
+function slateAgentSystemPrompt(cwd, toolNames) {
+  const names = new Set(toolNames || []);
+  const lines = [
+    "You are running behind a local compatibility layer that emulates Slate's internal agent tools.",
+    `Current working directory: ${cwd}`,
+    'Never print raw tool invocations like `to=container.exec code=...` in normal text.',
+  ];
+
+  if (names.has("orchestrate")) {
+    lines.push("Use `orchestrate` to delegate focused subtasks to a worker with real repo tools.");
+    lines.push("Do not try to inspect files or run commands directly in your text output.");
+  }
+  if (names.has("view_tool_call")) {
+    lines.push("Use `view_tool_call` only when you need to inspect a previous orchestrate result by id.");
+  }
+  if (names.has("end_turn")) {
+    lines.push("When you are ready to answer the user, call `end_turn` with the exact final response.");
+  } else {
+    lines.push("When you are ready to answer the user, return the final response directly.");
+  }
+  lines.push("Avoid repeating the same subtask. Delegate, inspect the result, then finish.");
+  return lines.join("\n");
+}
+
+function withSlateAgentPrompt(messages, cwd, toolNames) {
+  return [{ role: "system", content: slateAgentSystemPrompt(cwd, toolNames) }, ...messages];
+}
+
+function buildSlateAgentPayload(route, messages, slotOverride, toolNames) {
+  let payload = {
+    model: route.model,
+    stream: false,
+    messages,
+    tools: slateAgentToolDefinitions(toolNames),
+    tool_choice: "auto",
+    parallel_tool_calls: false,
+  };
+  if (slotOverride) {
+    payload = deepMerge(payload, slotOverride);
+    payload.model = route.model;
+    payload.stream = false;
+    payload.messages = messages;
+    payload.tools = slateAgentToolDefinitions(toolNames);
+    payload.tool_choice = "auto";
+    payload.parallel_tool_calls = false;
+  }
+  return payload;
+}
+
+function buildOrchestrateResult(workerResult) {
+  return {
+    ok: workerResult.finishReason !== "length",
+    summary: workerResult.text,
+    changedFiles: collectChangedFiles(workerResult.toolExecutions),
+    finishReason: workerResult.finishReason,
+    toolCallCount: workerResult.toolExecutions.length,
+  };
+}
+
+async function proxyWorkerWithSlateTools(res, requestBody, runtime, route, slotOverride) {
+  const cwd = extractWorkingDirectory(requestBody);
+  let messages = withSlateAgentPrompt(translateMessages(requestBody.messages), cwd, requestBody.toolNames);
+  let totalUsage = null;
+  const toolCallStore = new Map();
+
+  for (let step = 0; step < 12; step += 1) {
+    const responseJson = await callCliProxyChat(
+      runtime,
+      buildSlateAgentPayload(route, messages, slotOverride, requestBody.toolNames)
+    );
+    const choice = responseJson?.choices?.[0] || {};
+    const assistantMessage = choice.message || {};
+    const rawText = normalizeMessageContent(assistantMessage.content);
+    const visibleText = sanitizeAssistantContent(rawText);
+    const calls = nativeToolCallsFromMessage(assistantMessage);
+    totalUsage = mergeUsageTotals(totalUsage, responseJson.usage);
+
+    if (assistantMessage.reasoning_content) {
+      emitSse(res, "reasoning", {
+        details: [
+          {
+            type: "reasoning.text",
+            text: String(assistantMessage.reasoning_content),
+            format: "openai-compatible-v1",
+            index: 0,
+          },
+        ],
+      });
+    }
+
+    if (calls.length === 0) {
+      emitTextChunks(res, visibleText || rawText);
+      emitSse(res, "finish_message", {
+        finishReason: choice.finish_reason || "stop",
+        usage: finishUsage(responseJson.usage),
+      });
+      if (totalUsage) {
+        emitSse(res, "usage", slateUsage(route.model, totalUsage));
+      }
+      return;
+    }
+
+    messages.push({
+      role: "assistant",
+      content: visibleText || "",
+      tool_calls: assistantMessage.tool_calls,
+    });
+    emitTextChunks(res, visibleText);
+
+    for (const call of calls) {
+      let result;
+      if (call.toolName === "orchestrate") {
+        emitToolCallStart(res, call.toolCallId, call.toolName, call.args);
+        const workerMessages = withWorkerToolPrompt(
+          [
+            {
+              role: "user",
+              content: [
+                "Execute this delegated task inside the current workspace.",
+                `Task: ${String(call.args.task || "")}`,
+                call.args.successCriteria
+                  ? `Success criteria: ${String(call.args.successCriteria)}`
+                  : "",
+              ]
+                .filter(Boolean)
+                .join("\n"),
+            },
+          ],
+          cwd
+        );
+        const workerResult = await runLocalWorkerLoop({
+          runtime,
+          model: localModelId(runtime.slotDefaults.subagent),
+          slotOverride: runtime.slotRequestOverrides.subagent || null,
+          messages: workerMessages,
+          cwd,
+          taskText: String(call.args.task || ""),
+          maxSteps: 24,
+        });
+        result = buildOrchestrateResult(workerResult);
+        emitToolResult(res, call.toolCallId, result);
+      } else if (call.toolName === "view_tool_call") {
+        result =
+          toolCallStore.get(String(call.args.toolCallId || "")) ||
+          { ok: false, error: `Unknown toolCallId: ${String(call.args.toolCallId || "")}` };
+        emitToolLifecycle(res, call.toolCallId, call.toolName, call.args, result);
+      } else if (call.toolName === "end_turn") {
+        const responseText = String(call.args.response || "").trim();
+        emitToolLifecycle(res, call.toolCallId, call.toolName, call.args, {
+          ok: true,
+          responsePreview: previewText(responseText, 400),
+        });
+        emitTextChunks(res, responseText);
+        emitSse(res, "finish_message", {
+          finishReason: "stop",
+          usage: finishUsage(responseJson.usage),
+        });
+        if (totalUsage) {
+          emitSse(res, "usage", slateUsage(route.model, totalUsage));
+        }
+        return;
+      } else {
+        result = { ok: false, error: `Unsupported Slate tool: ${call.toolName}` };
+        emitToolLifecycle(res, call.toolCallId, call.toolName, call.args, result);
+      }
+
+      toolCallStore.set(call.toolCallId, result);
+      messages.push({
+        role: "tool",
+        tool_call_id: call.toolCallId,
+        content: JSON.stringify(result),
+      });
+    }
+
+    emitSse(res, "finish_step", {
+      finishReason: "tool_call",
+      isContinued: true,
       usage: finishUsage(responseJson.usage),
     });
-    if (totalUsage) {
-      emitSse(res, "usage", slateUsage(route.model, totalUsage));
-    }
-    return;
   }
 
   emitSse(res, "text", {
-    chunk: "Local proxy stopped after too many tool iterations.",
+    chunk: "Local proxy stopped after too many orchestration steps.",
   });
   emitSse(res, "finish_message", {
     finishReason: "length",
@@ -1114,7 +1476,7 @@ async function proxyWorkerStream(req, res, rawBody) {
       connection: "keep-alive",
       "access-control-allow-origin": "*",
     });
-    await proxyWorkerWithLocalTools(res, requestBody, runtime, route, slotOverride);
+    await proxyWorkerWithSlateTools(res, requestBody, runtime, route, slotOverride);
     res.end();
     return;
   }
