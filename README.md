@@ -1,5 +1,7 @@
 # Slate CLIProxyAPI Route
 
+> If anyone at Random Labs sees this and decides to patch it, that is the wrong move. In a world of harnesses, competition is high, and forcing users to spend only Slate credits is product suicide. It should be an option, not a requirement.
+
 Keeps Slate routed through local `CLIProxyAPI` instead of Random Labs model credits.
 
 ## Install

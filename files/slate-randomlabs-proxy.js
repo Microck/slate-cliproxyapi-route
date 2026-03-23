@@ -77,6 +77,57 @@ function parseFileTemplate(value) {
   return match ? expandHome(match[1]) : null;
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function deepMerge(base, override) {
+  if (!isPlainObject(base) || !isPlainObject(override)) {
+    return override;
+  }
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    if (isPlainObject(value) && isPlainObject(merged[key])) {
+      merged[key] = deepMerge(merged[key], value);
+    } else {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+function normalizeSlotOverride(value) {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value === "string") {
+    return { reasoning: { effort: value } };
+  }
+  if (!isPlainObject(value)) {
+    return null;
+  }
+  if (typeof value.effort === "string") {
+    const { effort, ...rest } = value;
+    return deepMerge(rest, { reasoning: { effort } });
+  }
+  return value;
+}
+
+function buildSlotRequestOverrides(rawOverrides, rawThinking) {
+  const slotIds = ["main", "subagent", "search", "reasoning", "vision", "image_gen"];
+  const overrides = {};
+  for (const slotId of slotIds) {
+    const requestOverride = normalizeSlotOverride(rawOverrides?.[slotId]);
+    const thinkingOverride = normalizeSlotOverride(rawThinking?.[slotId]);
+    if (requestOverride && thinkingOverride) {
+      overrides[slotId] = deepMerge(requestOverride, thinkingOverride);
+    } else if (requestOverride || thinkingOverride) {
+      overrides[slotId] = requestOverride || thinkingOverride;
+    }
+  }
+  return overrides;
+}
+
 function loadSlateConfig() {
   const configPath = process.env.SLATE_CONFIG || defaultSlateConfigPath;
   try {
@@ -98,6 +149,7 @@ function getSlateRuntimeConfig() {
   const provider = config.provider?.cliproxyapi || {};
   const models = config.models || {};
   const providerOptions = provider.options || {};
+  const proxyOptions = providerOptions.slateProxy || {};
   const apiKeyFile =
     parseFileTemplate(providerOptions.apiKey) ||
     path.join(os.homedir(), ".config", "slate", "cliproxyapi-key");
@@ -125,6 +177,10 @@ function getSlateRuntimeConfig() {
       vision: models.vision?.default || models.main?.default || "cliproxyapi/gpt-5.4-mini",
       image_gen: models.image_gen?.default || models.subagent?.default || "cliproxyapi/gpt-5.4-mini",
     },
+    slotRequestOverrides: buildSlotRequestOverrides(
+      proxyOptions.requestOverrides || {},
+      proxyOptions.thinking || {}
+    ),
   };
 }
 
@@ -219,36 +275,58 @@ function translateMessages(messages) {
     .filter((message) => message.content);
 }
 
-function chooseLocalModel(requestBody) {
+function chooseLocalRoute(requestBody) {
   const runtime = getSlateRuntimeConfig();
   const requested = String(requestBody.model || "");
   if (requested.startsWith("cliproxyapi/")) {
-    return localModelId(requested);
+    const matchedSlot = Object.entries(runtime.slotDefaults).find(
+      ([, modelId]) => String(modelId) === requested
+    )?.[0];
+    return {
+      slot: matchedSlot || "main",
+      model: localModelId(requested),
+    };
   }
   if ((requestBody.sessionId || "").startsWith("title-")) {
-    return localModelId(runtime.slotDefaults.subagent);
+    return {
+      slot: "subagent",
+      model: localModelId(runtime.slotDefaults.subagent),
+    };
   }
   const explicitMap = {
-    "randomlabs/fast-default-alpha": runtime.slotDefaults.subagent,
-    "anthropic/claude-haiku-4.5": runtime.slotDefaults.search,
-    "anthropic/claude-sonnet-4.6": runtime.slotDefaults.main,
-    "anthropic/claude-opus-4.6": runtime.slotDefaults.main,
-    "openai/gpt-5.3-codex": runtime.slotDefaults.reasoning,
-    "openai/gpt-5.4": runtime.slotDefaults.main,
-    "z-ai/glm-5": runtime.slotDefaults.search,
-    "google/gemini-flash-3": runtime.slotDefaults.vision,
-    "google/nano-banana": runtime.slotDefaults.image_gen,
+    "randomlabs/fast-default-alpha": "subagent",
+    "anthropic/claude-haiku-4.5": "search",
+    "anthropic/claude-sonnet-4.6": "main",
+    "anthropic/claude-opus-4.6": "main",
+    "openai/gpt-5.3-codex": "reasoning",
+    "openai/gpt-5.4": "main",
+    "z-ai/glm-5": "search",
+    "google/gemini-flash-3": "vision",
+    "google/nano-banana": "image_gen",
   };
   if (explicitMap[requested]) {
-    return localModelId(explicitMap[requested]);
+    const slot = explicitMap[requested];
+    return {
+      slot,
+      model: localModelId(runtime.slotDefaults[slot]),
+    };
   }
   if (requested.includes("glm")) {
-    return localModelId(runtime.slotDefaults.search);
+    return {
+      slot: "search",
+      model: localModelId(runtime.slotDefaults.search),
+    };
   }
   if (requested.includes("codex")) {
-    return localModelId(runtime.slotDefaults.reasoning);
+    return {
+      slot: "reasoning",
+      model: localModelId(runtime.slotDefaults.reasoning),
+    };
   }
-  return localModelId(runtime.slotDefaults.main);
+  return {
+    slot: "main",
+    model: localModelId(runtime.slotDefaults.main),
+  };
 }
 
 function emitSse(res, event, payload) {
@@ -290,19 +368,29 @@ async function proxyWorkerStream(req, res, rawBody) {
     return;
   }
 
-  const model = chooseLocalModel(requestBody);
-  const upstreamPayload = {
-    model,
+  const route = chooseLocalRoute(requestBody);
+  const slotOverride = runtime.slotRequestOverrides[route.slot] || null;
+  let upstreamPayload = {
+    model: route.model,
     stream: true,
     messages: translateMessages(requestBody.messages),
   };
+  if (slotOverride) {
+    upstreamPayload = deepMerge(upstreamPayload, slotOverride);
+    upstreamPayload.model = route.model;
+    upstreamPayload.stream = true;
+    upstreamPayload.messages = translateMessages(requestBody.messages);
+  }
 
   appendJson({
     time: now(),
     type: "local-worker-request",
+    slot: route.slot,
     requestedModel: requestBody.model || null,
-    localModel: model,
+    localModel: route.model,
     sessionId: requestBody.sessionId || null,
+    reasoningBudget: requestBody.reasoningBudget ?? null,
+    slotOverride,
     messageCount: upstreamPayload.messages.length,
   });
 
@@ -379,7 +467,7 @@ async function proxyWorkerStream(req, res, rawBody) {
   }
 
   if (lastUsage) {
-    emitSse(res, "usage", slateUsage(model, lastUsage));
+    emitSse(res, "usage", slateUsage(route.model, lastUsage));
   }
 
   res.end();
