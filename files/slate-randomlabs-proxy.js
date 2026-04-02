@@ -974,6 +974,23 @@ function slateAgentToolDefinitions(toolNames) {
     });
   }
 
+  if (names.has("message")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "message",
+        description: "Send a message to the user without ending the turn.",
+        parameters: {
+          type: "object",
+          properties: {
+            message: { type: "string" },
+          },
+          required: ["message"],
+        },
+      },
+    });
+  }
+
   return tools;
 }
 
