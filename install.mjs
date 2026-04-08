@@ -17,7 +17,7 @@ const backupRoot = path.join(
 );
 const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 const backupDir = path.join(backupRoot, timestamp);
-const files = ["slate", "slate-cliproxyapi", "slate-randomlabs-proxy.js"];
+const files = ["slate", "slate-randomlabs-proxy.js"];
 
 async function pathExists(filePath) {
   try {
